@@ -1,0 +1,97 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Core redemption record – every prize/cash-out request
+model Redemption {
+  id              String    @id @default(cuid())
+  externalUserId  String    // wallet address or user id from main app
+  amount          String    // decimal string
+  currency        String    @default("USD")
+  method          String    // CRYPTO_WALLET | BANK_TRANSFER | SWEEPSTAKES_PRIZE | GIFT_CARD | CHECK | OTHER
+  status          String    @default("PENDING") // PENDING | APPROVED | PROCESSING | COMPLETED | REJECTED | FAILED | CANCELLED
+  destination     String?   // wallet address, bank ref, or destination id
+  payoutRef       String?   // external tx id, check number, etc. after completion
+  requestedAt     DateTime  @default(now())
+  completedAt     DateTime?
+  approvedAt      DateTime?
+  approvedBy      String?
+  rejectionReason String?
+  metadata        String?   // JSON: gameRef, campaignId, source balance type (SC/GC), etc.
+  reconciliationRunId String?
+  reconciliationRun ReconciliationRun? @relation(fields: [reconciliationRunId], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  auditEntries    RedemptionAuditEntry[]
+  fraudChecks     FraudCheck[]
+  reconciliationMatches ReconciliationMatch[]
+}
+
+// Immutable append-only audit chain: every state change + hash chain for integrity
+model RedemptionAuditEntry {
+  id           String   @id @default(cuid())
+  redemptionId  String
+  redemption   Redemption @relation(fields: [redemptionId], references: [id], onDelete: Cascade)
+  eventType    String   // CREATED | STATUS_CHANGED | APPROVED | REJECTED | COMPLETED | FAILED | RECONCILED | FRAUD_CHECK | etc.
+  payload      String   // JSON snapshot of redemption state (or delta) at this event
+  previousEntryId String? // id of previous entry in chain (global or per-redemption)
+  previousHash String?  // hash of previous entry – chain integrity
+  entryHash    String   // H(previousHash + redemptionId + eventType + payload + createdAt)
+  actorId      String?  // system | userId | admin id
+  createdAt    DateTime @default(now())
+
+  @@index([redemptionId])
+  @@index([createdAt])
+}
+
+// Reconciliation run: batch job that matches redemptions to payment/KYC
+model ReconciliationRun {
+  id          String   @id @default(cuid())
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  status      String   @default("RUNNING") // RUNNING | COMPLETED | FAILED | PARTIAL
+  summary     String?  // JSON: { matched, unmatched, kycBlocked, fraudFlagged, errors }
+  redemptions Redemption[]
+  matches     ReconciliationMatch[]
+}
+
+// Per-redemption reconciliation result (link to payment system + KYC)
+model ReconciliationMatch {
+  id                String   @id @default(cuid())
+  redemptionId      String
+  redemption       Redemption @relation(fields: [redemptionId], references: [id], onDelete: Cascade)
+  runId            String
+  run              ReconciliationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  status           String   // MATCHED | UNMATCHED | KYC_BLOCKED | FRAUD_FLAGGED | PAYMENT_NOT_FOUND | AMOUNT_MISMATCH
+  externalTxId     String?  // id from payment/withdrawal system
+  externalUserId   String?  // user id in payment system
+  kycStatus        String?  // APPROVED | PENDING | REJECTED – from KYC system at reconcile time
+  amountMatched    Boolean?
+  notes            String?
+  createdAt        DateTime @default(now())
+
+  @@unique([redemptionId, runId])
+  @@index([runId])
+}
+
+// Fraud/risk check per redemption (velocity, KYC, sanctions, manual)
+model FraudCheck {
+  id           String   @id @default(cuid())
+  redemptionId String
+  redemption   Redemption @relation(fields: [redemptionId], references: [id], onDelete: Cascade)
+  checkType    String   // VELOCITY | KYC | SANCTIONS | MANUAL | RULE_ENGINE
+  result       String   // PASS | FLAG | FAIL
+  score        Int?     // 0-100 risk score
+  details      String?  // JSON: counts, amounts, reason
+  checkedAt    DateTime @default(now())
+  checkedBy    String?  // system | actor id
+
+  @@index([redemptionId])
+  @@index([result])
+}
